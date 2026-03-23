@@ -3,20 +3,23 @@
 #include "imu.h"
 #include "pid.h"
 #include "motor.h"
+#include "debug.h"
 
 // ─────────────────────────────────────────────────────────────
-//  Self-Balancing Cube — Main Firmware
+//  Self-Balancing Cube — Main Firmware v1.0
 //  Layer 1: HAL & board config
 //  Layer 2: IMU driver & sensor fusion
 //  Layer 3: PID control loop
 //  Layer 4: Motor output (SimpleFOC)
+//  Layer 5: UART debug & telemetry
 // ─────────────────────────────────────────────────────────────
 
 // ── Objects ───────────────────────────────────────────────────
-IMUDriver     imu;
-CubePID pid_roll;
-CubePID pid_pitch;
-MotorManager  motors;
+IMUDriver    imu;
+CubePID      pid_roll;
+CubePID      pid_pitch;
+MotorManager motors;
+DebugManager dbg;
 
 // ── Timing ────────────────────────────────────────────────────
 volatile bool loop_flag  = false;
@@ -26,7 +29,7 @@ uint32_t      loop_count = 0;
 String serial_buf = "";
 
 // ── System state ──────────────────────────────────────────────
-bool system_armed = false;   // Must be explicitly armed via serial
+bool system_armed = false;
 
 // ── Forward declarations ──────────────────────────────────────
 void control_loop_isr();
@@ -49,9 +52,9 @@ void setup() {
     digitalWrite(IMU_CS_PIN, HIGH);
 
     // ── Layer 2: IMU ──────────────────────────────────────────
-    DEBUG_SERIAL.println("[INIT] Starting IMU...");
+    dbg.log("INIT", "Starting IMU...");
     if (!imu.begin()) {
-        DEBUG_SERIAL.println("[ERROR] IMU init failed — check SPI wiring");
+        dbg.log("ERROR", "IMU init failed — check SPI wiring");
         while (1) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(100); }
     }
     imu.calibrate(500);
@@ -61,10 +64,13 @@ void setup() {
     pid_pitch.begin(18.0f, 0.8f, 1.4f, 0.001f, -5.0f, 5.0f, 50.0f);
 
     // ── Layer 4: Motors ───────────────────────────────────────
-    DEBUG_SERIAL.println("[INIT] Starting motors...");
+    dbg.log("INIT", "Starting motors...");
     if (!motors.begin()) {
-        DEBUG_SERIAL.println("[WARN] Motor init issues — check wiring");
+        dbg.log("WARN", "Motor init issues — check wiring");
     }
+
+    // ── Layer 5: Debug ────────────────────────────────────────
+    dbg.begin();
 
     // ── 1kHz timer ────────────────────────────────────────────
     HardwareTimer *loop_timer = new HardwareTimer(TIM2);
@@ -72,21 +78,14 @@ void setup() {
     loop_timer->attachInterrupt(control_loop_isr);
     loop_timer->resume();
 
-    DEBUG_SERIAL.println("[INIT] All layers ready");
-    DEBUG_SERIAL.println("─────────────────────────────────────────────────────");
-    DEBUG_SERIAL.println("Serial commands:");
-    DEBUG_SERIAL.println("  ARM        — enable motors and start balancing");
-    DEBUG_SERIAL.println("  DISARM     — disable motors immediately");
-    DEBUG_SERIAL.println("  KP <val>   — set Kp (both axes)");
-    DEBUG_SERIAL.println("  KI <val>   — set Ki (both axes)");
-    DEBUG_SERIAL.println("  KD <val>   — set Kd (both axes)");
-    DEBUG_SERIAL.println("  GAINS      — print current gains");
-    DEBUG_SERIAL.println("  RESET      — reset PID state");
-    DEBUG_SERIAL.println("  STATUS     — print full system status");
-    DEBUG_SERIAL.println("─────────────────────────────────────────────────────");
+    dbg.log("INIT", "All layers ready — firmware v1.0");
+    DEBUG_SERIAL.println("─────────────────────────────────────────────");
+    DEBUG_SERIAL.println("Commands: ARM | DISARM | KP/KI/KD <val>");
+    DEBUG_SERIAL.println("          GAINS | RESET | STATUS");
+    DEBUG_SERIAL.println("─────────────────────────────────────────────");
     DEBUG_SERIAL.println(">>> Type ARM to start balancing <<<");
 
-    blink_status(4);
+    blink_status(5);    // 5 blinks = all layers ready
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -110,47 +109,56 @@ void loop() {
     loop_flag = false;
     loop_count++;
 
+    // ── Loop timing start ─────────────────────────────────────
+    dbg.mark_loop_start();
+
     // ── Layer 2: IMU update ───────────────────────────────────
     imu.update(0.001f);
     float roll  = imu.getRoll();
     float pitch = imu.getPitch();
 
-    // ── Safety cutoff — disarm if tilt too large ──────────────
+    // ── Safety cutoff ─────────────────────────────────────────
     if (fabsf(roll) > MAX_TILT_RAD || fabsf(pitch) > MAX_TILT_RAD) {
         if (system_armed) {
             system_armed = false;
             motors.emergency_stop();
             pid_roll.reset();
             pid_pitch.reset();
-            DEBUG_SERIAL.println("[SAFETY] Tilt limit exceeded — DISARMED");
+            dbg.log("SAFETY", "Tilt limit exceeded — DISARMED");
         }
         return;
     }
 
-    // ── Layer 3: PID compute ──────────────────────────────────
-    float tau_roll  = pid_roll.compute (0.0f, roll);
-    float tau_pitch = pid_pitch.compute(0.0f, pitch);
+    // ── Layer 3: PID ──────────────────────────────────────────
+    float tau_x = pid_roll.compute (0.0f, roll);
+    float tau_y = pid_pitch.compute(0.0f, pitch);
 
     // ── Layer 4: Motor output ─────────────────────────────────
     if (system_armed) {
-        motors.set_torques(tau_roll, tau_pitch, 0.0f);
+        motors.set_torques(tau_x, tau_y, 0.0f);
         motors.update();
     }
 
-    // ── Telemetry every 50ms (every 50 loops) ─────────────────
-    if (loop_count % 50 == 0) {
-        DEBUG_SERIAL.print(millis());
-        DEBUG_SERIAL.print("\t");
-        DEBUG_SERIAL.print(roll  * 57.296f, 2);
-        DEBUG_SERIAL.print("\t");
-        DEBUG_SERIAL.print(pitch * 57.296f, 2);
-        DEBUG_SERIAL.print("\t");
-        DEBUG_SERIAL.print(tau_roll,  3);
-        DEBUG_SERIAL.print("\t");
-        DEBUG_SERIAL.print(tau_pitch, 3);
-        DEBUG_SERIAL.print("\t");
-        DEBUG_SERIAL.println(system_armed ? "ARMED" : "DISARMED");
-        digitalWrite(LED_PIN, loop_count % 1000 == 0);
+    // ── Loop timing end ───────────────────────────────────────
+    dbg.mark_loop_end();
+
+    // ── Layer 5: Telemetry ────────────────────────────────────
+    TelemetryPacket pkt = {
+        .timestamp_ms = millis(),
+        .roll_deg     = roll  * 57.296f,
+        .pitch_deg    = pitch * 57.296f,
+        .p_term       = pid_roll.getP(),
+        .i_term       = pid_roll.getI(),
+        .d_term       = pid_roll.getD(),
+        .torque_x     = tau_x,
+        .torque_y     = tau_y,
+        .armed        = system_armed
+    };
+    dbg.update(pkt, loop_count);
+
+    // ── Heartbeat LED ─────────────────────────────────────────
+    if (loop_count % 1000 == 0) {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     }
 }
 
@@ -166,29 +174,29 @@ void parse_serial_command(String cmd) {
         motors.enable();
         pid_roll.reset();
         pid_pitch.reset();
-        DEBUG_SERIAL.println("[CMD] ARMED — balancing active");
+        dbg.log("CMD", "ARMED — balancing active");
 
     } else if (cmd == "DISARM") {
         system_armed = false;
         motors.disable();
         pid_roll.reset();
         pid_pitch.reset();
-        DEBUG_SERIAL.println("[CMD] DISARMED");
+        dbg.log("CMD", "DISARMED");
 
     } else if (cmd.startsWith("KP ")) {
         float v = cmd.substring(3).toFloat();
         pid_roll.set_kp(v); pid_pitch.set_kp(v);
-        DEBUG_SERIAL.print("[CMD] Kp="); DEBUG_SERIAL.println(v);
+        dbg.log_float("CMD", "Kp", v);
 
     } else if (cmd.startsWith("KI ")) {
         float v = cmd.substring(3).toFloat();
         pid_roll.set_ki(v); pid_pitch.set_ki(v);
-        DEBUG_SERIAL.print("[CMD] Ki="); DEBUG_SERIAL.println(v);
+        dbg.log_float("CMD", "Ki", v);
 
     } else if (cmd.startsWith("KD ")) {
         float v = cmd.substring(3).toFloat();
         pid_roll.set_kd(v); pid_pitch.set_kd(v);
-        DEBUG_SERIAL.print("[CMD] Kd="); DEBUG_SERIAL.println(v);
+        dbg.log_float("CMD", "Kd", v);
 
     } else if (cmd == "GAINS") {
         PIDGains g = pid_roll.getGains();
@@ -198,17 +206,20 @@ void parse_serial_command(String cmd) {
 
     } else if (cmd == "RESET") {
         pid_roll.reset(); pid_pitch.reset();
-        DEBUG_SERIAL.println("[CMD] PID state reset");
+        dbg.log("CMD", "PID state reset");
 
     } else if (cmd == "STATUS") {
         DEBUG_SERIAL.print("[STATUS] Armed=");
-        DEBUG_SERIAL.println(system_armed ? "YES" : "NO");
+        DEBUG_SERIAL.print(system_armed ? "YES" : "NO");
+        DEBUG_SERIAL.print("  Loop=");
+        DEBUG_SERIAL.print(dbg.get_loop_time_us());
+        DEBUG_SERIAL.println("us");
         imu.printAngles();
         pid_roll.print();
         motors.print();
 
     } else {
-        DEBUG_SERIAL.print("[CMD] Unknown: "); DEBUG_SERIAL.println(cmd);
+        dbg.log("CMD", "Unknown command");
     }
 }
 
@@ -219,8 +230,8 @@ void control_loop_isr() { loop_flag = true; }
 
 void print_system_info() {
     DEBUG_SERIAL.println("=========================================");
-    DEBUG_SERIAL.println("  Self-Balancing Cube — Firmware v0.4");
-    DEBUG_SERIAL.println("  L1:HAL  L2:IMU  L3:PID  L4:MOTOR");
+    DEBUG_SERIAL.println("  Self-Balancing Cube — Firmware v1.0");
+    DEBUG_SERIAL.println("  L1:HAL L2:IMU L3:PID L4:MOTOR L5:DBG");
     DEBUG_SERIAL.println("=========================================");
 }
 
