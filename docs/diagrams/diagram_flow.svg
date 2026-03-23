@@ -1,0 +1,73 @@
+<svg width="700" height="780" viewBox="0 0 700 780" xmlns="http://www.w3.org/2000/svg" font-family="Arial, sans-serif">
+  <rect width="700" height="780" fill="#0d1117"/>
+  <text x="350" y="30" fill="#e6edf3" font-size="16" font-weight="bold" text-anchor="middle">Self-Balancing Cube — Control Flow (1kHz Loop)</text>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- 1kHz ISR -->
+  <rect x="225" y="50" width="250" height="40" rx="20" fill="#2C2C2A" stroke="#888780" stroke-width="1"/>
+  <text x="350" y="75" fill="#D3D1C7" font-size="13" font-weight="bold" text-anchor="middle">1kHz timer ISR fires</text>
+  <line x1="350" y1="90" x2="350" y2="120" stroke="#888780" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- IMU read -->
+  <rect x="200" y="120" width="300" height="56" rx="8" fill="#04342C" stroke="#1D9E75" stroke-width="1"/>
+  <text x="350" y="143" fill="#9FE1CB" font-size="13" font-weight="bold" text-anchor="middle">Read IMU over SPI</text>
+  <text x="350" y="162" fill="#5DCAA5" font-size="11" text-anchor="middle">accel + gyro · 12 bytes burst read</text>
+  <line x1="350" y1="176" x2="350" y2="206" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Complementary filter -->
+  <rect x="200" y="206" width="300" height="56" rx="8" fill="#04342C" stroke="#1D9E75" stroke-width="1"/>
+  <text x="350" y="229" fill="#9FE1CB" font-size="13" font-weight="bold" text-anchor="middle">Complementary filter</text>
+  <text x="350" y="248" fill="#5DCAA5" font-size="11" text-anchor="middle">α=0.98 → roll + pitch (radians)</text>
+  <line x1="350" y1="262" x2="350" y2="292" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Safety check diamond -->
+  <polygon points="350,292 490,330 350,368 210,330" fill="#501313" stroke="#E24B4A" stroke-width="1"/>
+  <text x="350" y="325" fill="#F7C1C1" font-size="12" font-weight="bold" text-anchor="middle">|angle| &gt; 30°?</text>
+  <text x="350" y="343" fill="#F09595" font-size="10" text-anchor="middle">safety check</text>
+
+  <!-- YES → emergency stop -->
+  <path d="M490 330 L580 330 L580 420" fill="none" stroke="#E24B4A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="530" y="322" fill="#E24B4A" font-size="11">YES</text>
+  <rect x="520" y="420" width="140" height="56" rx="8" fill="#501313" stroke="#E24B4A" stroke-width="1"/>
+  <text x="590" y="443" fill="#F7C1C1" font-size="12" font-weight="bold" text-anchor="middle">Emergency stop</text>
+  <text x="590" y="462" fill="#F09595" font-size="10" text-anchor="middle">motors off · reset PID</text>
+
+  <!-- NO → continue -->
+  <line x1="350" y1="368" x2="350" y2="398" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="358" y="388" fill="#1D9E75" font-size="11">NO</text>
+
+  <!-- PID compute -->
+  <rect x="200" y="398" width="300" height="56" rx="8" fill="#412402" stroke="#BA7517" stroke-width="1"/>
+  <text x="350" y="421" fill="#FAC775" font-size="13" font-weight="bold" text-anchor="middle">PID compute</text>
+  <text x="350" y="440" fill="#EF9F27" font-size="11" text-anchor="middle">error = 0 − angle · P + I + D terms</text>
+  <line x1="350" y1="454" x2="350" y2="484" stroke="#BA7517" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Torque → voltage -->
+  <rect x="200" y="484" width="300" height="56" rx="8" fill="#412402" stroke="#BA7517" stroke-width="1"/>
+  <text x="350" y="507" fill="#FAC775" font-size="13" font-weight="bold" text-anchor="middle">Torque → voltage map</text>
+  <text x="350" y="526" fill="#EF9F27" font-size="11" text-anchor="middle">deadband · clamp · lag filter</text>
+  <line x1="350" y1="540" x2="350" y2="570" stroke="#BA7517" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- SimpleFOC -->
+  <rect x="200" y="570" width="300" height="56" rx="8" fill="#4A1B0C" stroke="#D85A30" stroke-width="1"/>
+  <text x="350" y="593" fill="#F5C4B3" font-size="13" font-weight="bold" text-anchor="middle">SimpleFOC loopFOC()</text>
+  <text x="350" y="612" fill="#F0997B" font-size="11" text-anchor="middle">FOC · 3-PWM · motors X + Y + Z</text>
+  <line x1="350" y1="626" x2="350" y2="656" stroke="#D85A30" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Telemetry -->
+  <rect x="200" y="656" width="300" height="56" rx="8" fill="#26215C" stroke="#7F77DD" stroke-width="1"/>
+  <text x="350" y="679" fill="#CECBF6" font-size="13" font-weight="bold" text-anchor="middle">Telemetry (every 50 loops)</text>
+  <text x="350" y="698" fill="#AFA9EC" font-size="11" text-anchor="middle">CSV → UART → plotter.py</text>
+
+  <!-- Loop back arrow -->
+  <path d="M200 684 L80 684 L80 70 L225 70" fill="none" stroke="#5F5E5A" stroke-width="1" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+  <text x="68" y="380" fill="#5F5E5A" font-size="20" text-anchor="middle">↻</text>
+  <text x="44" y="400" fill="#5F5E5A" font-size="10" text-anchor="middle">1ms</text>
+  <text x="44" y="415" fill="#5F5E5A" font-size="10" text-anchor="middle">loop</text>
+
+</svg>
