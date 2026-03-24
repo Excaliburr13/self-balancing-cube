@@ -113,7 +113,7 @@ class MotorModel:
     def __init__(self):
         self.deadband        = 0.05     # N·m — min torque threshold
         self.max_torque      = 0.8      # N·m physical limit
-        self.lag_tau         = 0.020    # s — electrical time constant
+        self.lag_tau         = 0.003    # s — electrical time constant
         self.actual_torque   = 0.0      # current output
         self.enabled         = True
 
@@ -150,15 +150,15 @@ class MotorModel:
 # ═══════════════════════════════════════════════════════════════
 class CubePID:
     def __init__(self):
-        self.kp = 18.0
-        self.ki = 0.8
-        self.kd = 1.4
+        self.kp = 30.0
+        self.ki = 0.25
+        self.kd = 7.3
         self.integral      = 0.0
         self.prev_error    = 0.0
         self.prev_deriv    = 0.0
-        self.deriv_alpha   = 0.239      # 50Hz cutoff at 1kHz
+        self.deriv_alpha   = 0.05     # 50Hz cutoff at 1kHz
         self.integral_limit= 10.0
-        self.out_max       = 5.0
+        self.out_max       = 0.8
         self.p = self.i = self.d = self.out = 0.0
 
     def compute(self, error, dt):
@@ -193,7 +193,7 @@ class CubePID:
 # ═══════════════════════════════════════════════════════════════
 class PhysicsEngine:
     def __init__(self):
-        self.theta      = 0.15    # rad — initial tilt
+        self.theta      = 0.08    # rad — initial tilt
         self.theta_dot  = 0.0
         self.omega_x    = 0.0    # wheel angular velocity
         self.omega_y    = 0.0
@@ -269,7 +269,7 @@ class FullSimulator:
 
         self.running  = False
         self.t        = 0.0
-        self.steps_per_frame = 10   # 10 physics steps per GUI frame
+        self.steps_per_frame = 50   # 10 physics steps per GUI frame
 
         # History buffers
         self.hist_t      = deque(maxlen=HISTORY)
@@ -293,8 +293,8 @@ class FullSimulator:
                                top=0.93, bottom=0.08,
                                hspace=0.55, wspace=0.35)
         gs_3d = gridspec.GridSpec(1, 1, figure=self.fig,
-                                   left=0.74, right=0.99,
-                                   top=0.70, bottom=0.35)
+                                   left=0.72, right=0.98,
+                                   top=0.49, bottom=0.12)
 
         # ── Plot axes ─────────────────────────────────────────
         self.ax_angle  = self.fig.add_subplot(gs[0, :])
@@ -359,9 +359,9 @@ class FullSimulator:
         # PID sliders
         self.fig.text(0.745, 0.96, 'PID gains',
                       color='#c9d1d9', fontsize=10, fontweight='bold')
-        self.sl_kp = sl([0.745,0.905,0.22,0.022],'Kp', 0,60,18,'#58a6ff')
-        self.sl_ki = sl([0.745,0.875,0.22,0.022],'Ki', 0, 5,0.8,'#3fb950')
-        self.sl_kd = sl([0.745,0.845,0.22,0.022],'Kd', 0, 8,1.4,'#f78166')
+        self.sl_kp = sl([0.745,0.905,0.22,0.022],'Kp', 0,60,30,'#58a6ff')
+        self.sl_ki = sl([0.745,0.875,0.22,0.022],'Ki', 0, 5,0.25,'#3fb950')
+        self.sl_kd = sl([0.745,0.845,0.22,0.022],'Kd', 0, 13,7.3,'#f78166')
 
         # Realism sliders
         self.fig.text(0.745, 0.82, 'Realism',
@@ -484,6 +484,8 @@ class FullSimulator:
 
     # ── Physics step ──────────────────────────────────────────
     def _step(self):
+        angle_est = self.physics.theta  # default fallback
+        rate_est  = self.physics.theta_dot
         for _ in range(self.steps_per_frame):
             if not self.running:
                 break
@@ -501,7 +503,7 @@ class FullSimulator:
 
             # PID
             error  = 0.0 - angle_est
-            tau_d  = self.pid.compute(error, DT)
+            tau_d  = -self.pid.compute(error, DT)
 
             # Battery
             vbat = self.battery.update(abs(tau_d)*3, DT)
@@ -514,6 +516,7 @@ class FullSimulator:
                 tau_actual = result
 
             # Physics
+            print(f"tau_actual={tau_actual:.6f}  tau_d={tau_d:.6f}  running={self.running}")
             theta, _ = self.physics.step(tau_actual, 0.0, DT)
 
             self.t += DT
@@ -549,10 +552,13 @@ class FullSimulator:
         face_color = '#1D9E75' if stable else '#D85A30'
         alpha = 0.55
 
-        poly = Poly3DCollection(faces, alpha=alpha,
-                                 facecolor=face_color,
-                                 edgecolor='#58a6ff',
-                                 linewidth=0.5)
+        poly = Poly3DCollection(faces,
+                         facecolor=face_color,
+                         edgecolor='#58a6ff',
+                         linewidth=0.8)
+        poly.set_alpha(0.55)
+
+
         self.ax_3d.add_collection3d(poly)
 
         # Balance point indicator — vertical line
@@ -590,6 +596,11 @@ class FullSimulator:
         update_line(self.ln_i,     t_arr, list(self.hist_i),      self.ax_pid)
         update_line(self.ln_d,     t_arr, list(self.hist_d),      self.ax_pid)
         update_line(self.ln_tau,   t_arr, list(self.hist_torque), self.ax_pid)
+        # Fix ax_pid minimum readable Y range
+        ymin, ymax = self.ax_pid.get_ylim()
+        if abs(ymax - ymin) < 0.01:
+            self.ax_pid.set_ylim(-0.05, 0.05)
+
         update_line(self.ln_vbat,  t_arr, list(self.hist_vbat),  self.ax_bat)
 
         # 3D cube
