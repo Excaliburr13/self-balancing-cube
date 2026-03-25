@@ -1,16 +1,17 @@
 """
-Self-Balancing Cube — Full Realistic Simulation
-================================================
+Self-Balancing Cube — Full Realistic Simulation (Dual-Axis)
+============================================================
 Run:  python sim_full.py
 Deps: numpy, matplotlib, scipy (already installed)
 
 Models included:
-  - RK4 rigid body physics
-  - IMU gaussian noise + gyro bias drift
-  - Motor deadband, saturation, torque lag
-  - Battery voltage sag under load
+  - RK4 rigid body physics  — BOTH roll (X) and pitch (Y) axes
+  - Dual independent PID controllers (one per axis)
+  - IMU gaussian noise + gyro bias drift  (one per axis)
+  - Motor deadband, saturation, torque lag (one per axis)
+  - Battery voltage sag under combined load
   - Physical disturbance injection
-  - Real-time 3D cube visualization
+  - Real-time 3D cube visualization with dual-axis rotation
 """
 
 import numpy as np
@@ -37,7 +38,7 @@ DT       = 0.001          # 1kHz control loop
 HISTORY  = 600            # 6 seconds of history
 
 # ═══════════════════════════════════════════════════════════════
-#  IMU NOISE MODEL
+#  IMU NOISE MODEL  (instantiated separately for each axis)
 # ═══════════════════════════════════════════════════════════════
 class IMUModel:
     def __init__(self):
@@ -92,7 +93,7 @@ class BatteryModel:
         if not self.enabled:
             return self.voltage_full
 
-        # Voltage sag under load
+        # Voltage sag under combined load
         self.voltage = self.voltage_full * self.soc \
                      - self.internal_resist * current_draw_a
 
@@ -107,7 +108,7 @@ class BatteryModel:
         self.voltage    = self.voltage_full
 
 # ═══════════════════════════════════════════════════════════════
-#  MOTOR MODEL
+#  MOTOR MODEL  (instantiated separately for each axis)
 # ═══════════════════════════════════════════════════════════════
 class MotorModel:
     def __init__(self):
@@ -119,7 +120,7 @@ class MotorModel:
 
     def update(self, demanded_torque, battery_voltage, dt):
         if not self.enabled:
-            return 0.0
+            return 0.0, 0.0
 
         # Battery scaling — less voltage = less max torque
         voltage_factor = battery_voltage / 12.6
@@ -138,7 +139,7 @@ class MotorModel:
         self.actual_torque = alpha * demanded_torque \
                            + (1 - alpha) * self.actual_torque
 
-        # Estimate current draw (rough: P = τ·ω, I = P/V)
+        # Estimate current draw
         current = abs(self.actual_torque) * 50 / max(battery_voltage, 1)
         return self.actual_torque, current
 
@@ -146,7 +147,7 @@ class MotorModel:
         self.actual_torque = 0.0
 
 # ═══════════════════════════════════════════════════════════════
-#  PID CONTROLLER
+#  PID CONTROLLER  (instantiated separately for each axis)
 # ═══════════════════════════════════════════════════════════════
 class CubePID:
     def __init__(self):
@@ -189,70 +190,98 @@ class CubePID:
         self.p = self.i = self.d = self.out = 0.0
 
 # ═══════════════════════════════════════════════════════════════
-#  PHYSICS ENGINE
+#  PHYSICS ENGINE  — dual-axis RK4
 # ═══════════════════════════════════════════════════════════════
 class PhysicsEngine:
     def __init__(self):
-        self.theta      = 0.08    # rad — initial tilt
+        # Roll  (X axis)
+        self.theta      = 0.08    # rad — initial tilt on X
         self.theta_dot  = 0.0
-        self.omega_x    = 0.0    # wheel angular velocity
-        self.omega_y    = 0.0
+        self.omega_x    = 0.0    # X reaction wheel angular velocity
+
+        # Pitch (Y axis)
+        self.phi        = 0.05    # rad — initial tilt on Y
+        self.phi_dot    = 0.0
+        self.omega_y    = 0.0    # Y reaction wheel angular velocity
+
+    def _derivatives(self, state, tau):
+        """Shared ODE for a single axis.  state = [angle, angle_dot, omega_wheel]"""
+        th, th_dot, om = state
+        th_ddot = (M * g * L * np.sin(th) - tau) / (I_cube + I_wheel)
+        om_dot  = tau / I_wheel
+        return np.array([th_dot, th_ddot, om_dot])
+
+    def _rk4(self, state, tau, dt):
+        k1 = self._derivatives(state,             tau)
+        k2 = self._derivatives(state + 0.5*dt*k1, tau)
+        k3 = self._derivatives(state + 0.5*dt*k2, tau)
+        k4 = self._derivatives(state +    dt*k3,  tau)
+        return state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
     def step(self, tau_x, tau_y, dt):
-        def derivatives(state, tau):
-            th, th_dot, om = state
-            th_ddot = (M*g*L*np.sin(th) - tau) / (I_cube + I_wheel)
-            om_dot  = tau / I_wheel
-            return np.array([th_dot, th_ddot, om_dot])
-
-        # RK4 for roll (X axis)
+        # Integrate X axis (roll)
         s_x = np.array([self.theta, self.theta_dot, self.omega_x])
-        k1 = derivatives(s_x, tau_x)
-        k2 = derivatives(s_x + 0.5*dt*k1, tau_x)
-        k3 = derivatives(s_x + 0.5*dt*k2, tau_x)
-        k4 = derivatives(s_x + dt*k3, tau_x)
-        s_x += (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+        s_x = self._rk4(s_x, tau_x, dt)
+        self.theta, self.theta_dot, self.omega_x = s_x
 
-        self.theta     = s_x[0]
-        self.theta_dot = s_x[1]
-        self.omega_x   = s_x[2]
+        # Integrate Y axis (pitch)  ← was missing before
+        s_y = np.array([self.phi, self.phi_dot, self.omega_y])
+        s_y = self._rk4(s_y, tau_y, dt)
+        self.phi, self.phi_dot, self.omega_y = s_y
 
-        return self.theta, self.theta_dot
+        return self.theta, self.theta_dot, self.phi, self.phi_dot
 
     def apply_disturbance(self, magnitude=0.8):
-        self.theta_dot += magnitude * (1 if np.random.rand()>0.5 else -1)
+        """Kick both axes with random direction."""
+        self.theta_dot += magnitude * (1 if np.random.rand() > 0.5 else -1)
+        self.phi_dot   += magnitude * 0.6 * (1 if np.random.rand() > 0.5 else -1)
 
     def reset(self):
         self.theta     = 0.15
         self.theta_dot = 0.0
         self.omega_x   = 0.0
+        self.phi       = 0.10
+        self.phi_dot   = 0.0
         self.omega_y   = 0.0
 
 # ═══════════════════════════════════════════════════════════════
-#  3D CUBE VISUALIZER
+#  3D CUBE VISUALIZER  — dual-axis rotation
 # ═══════════════════════════════════════════════════════════════
-def make_cube_faces(theta):
-    """Generate cube face vertices rotated by theta around X axis."""
+def make_cube_faces(theta, phi):
+    """
+    Generate cube face vertices rotated by:
+      theta  — roll  around the X axis
+      phi    — pitch around the Y axis
+    """
     s = L
     verts = np.array([
         [-s,-s,-s], [ s,-s,-s], [ s, s,-s], [-s, s,-s],
         [-s,-s, s], [ s,-s, s], [ s, s, s], [-s, s, s]
-    ])
-    # Rotation around X axis
+    ], dtype=float)
+
+    # Rotation around X axis (roll)
     Rx = np.array([
-        [1,           0,            0],
+        [1,              0,             0],
         [0,  np.cos(theta), -np.sin(theta)],
         [0,  np.sin(theta),  np.cos(theta)]
     ])
-    verts = (Rx @ verts.T).T
+    # Rotation around Y axis (pitch)
+    Ry = np.array([
+        [ np.cos(phi), 0, np.sin(phi)],
+        [           0, 1,           0],
+        [-np.sin(phi), 0, np.cos(phi)]
+    ])
+    # Combined: first roll, then pitch
+    R = Ry @ Rx
+    verts = (R @ verts.T).T
 
     faces = [
-        [verts[0],verts[1],verts[2],verts[3]],
-        [verts[4],verts[5],verts[6],verts[7]],
-        [verts[0],verts[1],verts[5],verts[4]],
-        [verts[2],verts[3],verts[7],verts[6]],
-        [verts[0],verts[3],verts[7],verts[4]],
-        [verts[1],verts[2],verts[6],verts[5]],
+        [verts[0], verts[1], verts[2], verts[3]],  # bottom
+        [verts[4], verts[5], verts[6], verts[7]],  # top
+        [verts[0], verts[1], verts[5], verts[4]],  # front
+        [verts[2], verts[3], verts[7], verts[6]],  # back
+        [verts[0], verts[3], verts[7], verts[4]],  # left
+        [verts[1], verts[2], verts[6], verts[5]],  # right
     ]
     return faces
 
@@ -262,31 +291,42 @@ def make_cube_faces(theta):
 class FullSimulator:
     def __init__(self):
         self.physics  = PhysicsEngine()
-        self.imu      = IMUModel()
         self.battery  = BatteryModel()
+
+        # ── Dual-axis control chains ───────────────────────────
+        self.imu_x    = IMUModel()
+        self.imu_y    = IMUModel()
+        self.pid_x    = CubePID()
+        self.pid_y    = CubePID()
         self.motor_x  = MotorModel()
-        self.pid      = CubePID()
+        self.motor_y  = MotorModel()
 
         self.running  = False
         self.t        = 0.0
-        self.steps_per_frame = 50   # 10 physics steps per GUI frame
+        self.steps_per_frame = 50
 
         # History buffers
-        self.hist_t      = deque(maxlen=HISTORY)
-        self.hist_theta  = deque(maxlen=HISTORY)
-        self.hist_est    = deque(maxlen=HISTORY)
-        self.hist_torque = deque(maxlen=HISTORY)
-        self.hist_p      = deque(maxlen=HISTORY)
-        self.hist_i      = deque(maxlen=HISTORY)
-        self.hist_d      = deque(maxlen=HISTORY)
-        self.hist_vbat   = deque(maxlen=HISTORY)
+        self.hist_t        = deque(maxlen=HISTORY)
+        # X axis (roll)
+        self.hist_theta    = deque(maxlen=HISTORY)
+        self.hist_est_x    = deque(maxlen=HISTORY)
+        self.hist_torque_x = deque(maxlen=HISTORY)
+        # Y axis (pitch)
+        self.hist_phi      = deque(maxlen=HISTORY)
+        self.hist_est_y    = deque(maxlen=HISTORY)
+        self.hist_torque_y = deque(maxlen=HISTORY)
+        # Shared
+        self.hist_p        = deque(maxlen=HISTORY)
+        self.hist_i        = deque(maxlen=HISTORY)
+        self.hist_d        = deque(maxlen=HISTORY)
+        self.hist_vbat     = deque(maxlen=HISTORY)
 
         self._build_gui()
 
     def _build_gui(self):
         self.fig = plt.figure(figsize=(16, 9), facecolor='#0d1117')
         self.fig.canvas.manager.set_window_title(
-            'Self-Balancing Cube — Full Realistic Simulation')
+            'Self-Balancing Cube — Dual-Axis Simulation')
 
         gs = gridspec.GridSpec(3, 3, figure=self.fig,
                                left=0.05, right=0.72,
@@ -311,9 +351,10 @@ class FullSimulator:
             ax.grid(True, color='#21262d', linewidth=0.5, linestyle='--')
             ax.axhline(0, color='#3fb950', lw=0.8, ls='--', alpha=0.5)
 
-        self.ax_angle.set_title('Angle (rad) — true vs IMU estimate',
-                                 color='#c9d1d9', fontsize=9)
-        self.ax_pid.set_title('PID terms + torque',
+        self.ax_angle.set_title(
+            'Roll θ (X) & Pitch φ (Y) — solid=true  dashed=IMU estimate',
+            color='#c9d1d9', fontsize=9)
+        self.ax_pid.set_title('Torque output — X (roll) & Y (pitch)',
                                color='#c9d1d9', fontsize=9)
         self.ax_bat.set_title('Battery voltage (V)',
                                color='#c9d1d9', fontsize=9)
@@ -323,19 +364,32 @@ class FullSimulator:
         self.ax_3d.tick_params(colors='#8b949e', labelsize=6)
 
         # ── Lines ─────────────────────────────────────────────
-        self.ln_true, = self.ax_angle.plot([], [], '#58a6ff', lw=1.5,
-                                            label='true angle')
-        self.ln_est,  = self.ax_angle.plot([], [], '#f78166', lw=1,
-                                            ls='--', label='IMU estimate')
-        self.ln_p,    = self.ax_pid.plot([], [], '#58a6ff', lw=1, label='P')
-        self.ln_i,    = self.ax_pid.plot([], [], '#3fb950', lw=1, label='I')
-        self.ln_d,    = self.ax_pid.plot([], [], '#f78166', lw=1, label='D')
-        self.ln_tau,  = self.ax_pid.plot([], [], '#ffa657', lw=2, label='τ')
-        self.ln_vbat, = self.ax_bat.plot([], [], '#d2a8ff', lw=1.5,
-                                          label='V_bat')
+        # Roll (X) — blues
+        self.ln_theta,    = self.ax_angle.plot([], [], '#58a6ff', lw=1.5,
+                                                label='θ roll (true)')
+        self.ln_est_x,    = self.ax_angle.plot([], [], '#58a6ff', lw=1.0,
+                                                ls='--', alpha=0.7,
+                                                label='θ roll (IMU)')
+        # Pitch (Y) — oranges
+        self.ln_phi,      = self.ax_angle.plot([], [], '#ffa657', lw=1.5,
+                                                label='φ pitch (true)')
+        self.ln_est_y,    = self.ax_angle.plot([], [], '#ffa657', lw=1.0,
+                                                ls='--', alpha=0.7,
+                                                label='φ pitch (IMU)')
+
+        # Torque lines
+        self.ln_tau_x,    = self.ax_pid.plot([], [], '#58a6ff', lw=2,
+                                              label='τ_x (roll)')
+        self.ln_tau_y,    = self.ax_pid.plot([], [], '#ffa657', lw=2,
+                                              label='τ_y (pitch)')
+
+        # Battery
+        self.ln_vbat,     = self.ax_bat.plot([], [], '#d2a8ff', lw=1.5,
+                                              label='V_bat')
 
         self.ax_angle.legend(fontsize=7, facecolor='#161b22',
-                              labelcolor='#c9d1d9', framealpha=0.8)
+                              labelcolor='#c9d1d9', framealpha=0.8,
+                              loc='upper right')
         self.ax_pid.legend(fontsize=7, facecolor='#161b22',
                             labelcolor='#c9d1d9', framealpha=0.8)
 
@@ -356,8 +410,8 @@ class FullSimulator:
             s.valtext.set_color('#c9d1d9')
             return s
 
-        # PID sliders
-        self.fig.text(0.745, 0.96, 'PID gains',
+        # PID sliders (shared gains — both axes use the same tuning)
+        self.fig.text(0.745, 0.96, 'PID gains (both axes)',
                       color='#c9d1d9', fontsize=10, fontweight='bold')
         self.sl_kp = sl([0.745,0.905,0.22,0.022],'Kp', 0,60,30,'#58a6ff')
         self.sl_ki = sl([0.745,0.875,0.22,0.022],'Ki', 0, 5,0.25,'#3fb950')
@@ -391,7 +445,7 @@ class FullSimulator:
         self.btn_push  = btn([0.855,0.585,0.10,0.04],
                               'Push!','#9a6700','#b07800')
 
-        # Toggle checkboxes (simulated with buttons)
+        # Toggle checkboxes
         self.imu_on  = True
         self.bat_on  = True
         self.mot_on  = True
@@ -415,7 +469,6 @@ class FullSimulator:
         self.btn_bat.on_clicked(self._toggle_bat)
         self.btn_mot.on_clicked(self._toggle_mot)
 
-        # Slider callbacks
         for s in [self.sl_kp, self.sl_ki, self.sl_kd]:
             s.on_changed(self._update_gains)
         self.sl_noise.on_changed(self._update_noise)
@@ -437,13 +490,17 @@ class FullSimulator:
         self.running = False
         self.t = 0.0
         self.physics.reset()
-        self.imu.reset()
+        self.imu_x.reset()
+        self.imu_y.reset()
         self.battery.reset()
         self.motor_x.reset()
-        self.pid.reset()
-        for h in [self.hist_t, self.hist_theta, self.hist_est,
-                  self.hist_torque, self.hist_p, self.hist_i,
-                  self.hist_d, self.hist_vbat]:
+        self.motor_y.reset()
+        self.pid_x.reset()
+        self.pid_y.reset()
+        for h in [self.hist_t,
+                  self.hist_theta, self.hist_est_x, self.hist_torque_x,
+                  self.hist_phi,   self.hist_est_y, self.hist_torque_y,
+                  self.hist_p, self.hist_i, self.hist_d, self.hist_vbat]:
             h.clear()
         self.status_txt.set_text('RESET')
         self.status_txt.set_color('#f85149')
@@ -453,23 +510,30 @@ class FullSimulator:
         self.physics.apply_disturbance(mag)
 
     def _update_gains(self, _):
-        self.pid.kp = self.sl_kp.val
-        self.pid.ki = self.sl_ki.val
-        self.pid.kd = self.sl_kd.val
+        kp = self.sl_kp.val
+        ki = self.sl_ki.val
+        kd = self.sl_kd.val
+        for pid in (self.pid_x, self.pid_y):
+            pid.kp = kp
+            pid.ki = ki
+            pid.kd = kd
 
     def _update_noise(self, v):
-        self.imu.gyro_noise_std  = 0.003 * v
-        self.imu.accel_noise_std = 0.015 * v
+        for imu in (self.imu_x, self.imu_y):
+            imu.gyro_noise_std  = 0.003 * v
+            imu.accel_noise_std = 0.015 * v
 
     def _update_deadband(self, v):
         self.motor_x.deadband = v
+        self.motor_y.deadband = v
 
     def _update_sag(self, v):
         self.battery.internal_resist = 0.08 * v * 2
 
     def _toggle_imu(self, e):
         self.imu_on = not self.imu_on
-        self.imu.enabled = self.imu_on
+        self.imu_x.enabled = self.imu_on
+        self.imu_y.enabled = self.imu_on
         self.btn_imu.color = '#0f6e56' if self.imu_on else '#30363d'
 
     def _toggle_bat(self, e):
@@ -480,101 +544,128 @@ class FullSimulator:
     def _toggle_mot(self, e):
         self.mot_on = not self.mot_on
         self.motor_x.enabled = self.mot_on
+        self.motor_y.enabled = self.mot_on
         self.btn_mot.color = '#0f6e56' if self.mot_on else '#30363d'
 
     # ── Physics step ──────────────────────────────────────────
     def _step(self):
-        angle_est = self.physics.theta  # default fallback
-        rate_est  = self.physics.theta_dot
+        # Fallback estimates (used if loop doesn't run)
+        angle_x_est = self.physics.theta
+        angle_y_est = self.physics.phi
+
         for _ in range(self.steps_per_frame):
             if not self.running:
                 break
 
-            # Safety cutoff
-            if abs(self.physics.theta) > 0.6:
+            # Safety cutoff — both axes must be within range
+            if abs(self.physics.theta) > 0.6 or abs(self.physics.phi) > 0.6:
                 self.running = False
                 self.status_txt.set_text('FELL OVER')
                 self.status_txt.set_color('#f85149')
                 break
 
-            # IMU measurement
-            angle_est, rate_est = self.imu.update(
+            # ── IMU measurements ──────────────────────────────
+            angle_x_est, _ = self.imu_x.update(
                 self.physics.theta, self.physics.theta_dot, DT)
+            angle_y_est, _ = self.imu_y.update(
+                self.physics.phi,   self.physics.phi_dot,   DT)
 
-            # PID
-            error  = 0.0 - angle_est
-            tau_d  = -self.pid.compute(error, DT)
+            # ── PID — X axis (roll) ───────────────────────────
+            error_x = 0.0 - angle_x_est
+            tau_dx  = -self.pid_x.compute(error_x, DT)
 
-            # Battery
-            vbat = self.battery.update(abs(tau_d)*3, DT)
+            # ── PID — Y axis (pitch) ──────────────────────────
+            error_y = 0.0 - angle_y_est
+            tau_dy  = -self.pid_y.compute(error_y, DT)
 
-            # Motor
-            result = self.motor_x.update(tau_d, vbat, DT)
-            if isinstance(result, tuple):
-                tau_actual, _ = result
-            else:
-                tau_actual = result
+            # ── Battery — combined current draw ───────────────
+            vbat = self.battery.update(
+                abs(tau_dx) * 3 + abs(tau_dy) * 3, DT)
 
-            # Physics
-            print(f"tau_actual={tau_actual:.6f}  tau_d={tau_d:.6f}  running={self.running}")
-            theta, _ = self.physics.step(tau_actual, 0.0, DT)
+            # ── Motor X ───────────────────────────────────────
+            res_x = self.motor_x.update(tau_dx, vbat, DT)
+            tau_x_actual = res_x[0] if isinstance(res_x, tuple) else res_x
+
+            # ── Motor Y ───────────────────────────────────────
+            res_y = self.motor_y.update(tau_dy, vbat, DT)
+            tau_y_actual = res_y[0] if isinstance(res_y, tuple) else res_y
+
+            # ── Physics integration (BOTH axes) ───────────────
+            self.physics.step(tau_x_actual, tau_y_actual, DT)
 
             self.t += DT
 
         # Record history
         self.hist_t.append(self.t)
         self.hist_theta.append(self.physics.theta)
-        self.hist_est.append(angle_est if self.running or len(self.hist_est)==0
-                             else self.hist_est[-1])
-        self.hist_torque.append(self.pid.out)
-        self.hist_p.append(self.pid.p)
-        self.hist_i.append(self.pid.i)
-        self.hist_d.append(self.pid.d)
+        self.hist_phi.append(self.physics.phi)
+        self.hist_est_x.append(
+            angle_x_est if self.running or len(self.hist_est_x) == 0
+            else self.hist_est_x[-1])
+        self.hist_est_y.append(
+            angle_y_est if self.running or len(self.hist_est_y) == 0
+            else self.hist_est_y[-1])
+        self.hist_torque_x.append(self.pid_x.out)
+        self.hist_torque_y.append(self.pid_y.out)
+        self.hist_p.append(self.pid_x.p)
+        self.hist_i.append(self.pid_x.i)
+        self.hist_d.append(self.pid_x.d)
         self.hist_vbat.append(self.battery.voltage)
 
     # ── 3D cube update ────────────────────────────────────────
-    def _update_3d(self, theta):
+    def _update_3d(self, theta, phi):
         self.ax_3d.cla()
         self.ax_3d.set_facecolor('#161b22')
         self.ax_3d.set_xlim([-0.12, 0.12])
         self.ax_3d.set_ylim([-0.12, 0.12])
         self.ax_3d.set_zlim([-0.12, 0.12])
-        self.ax_3d.set_title(f'θ = {np.degrees(theta):.1f}°',
-                              color='#c9d1d9', fontsize=9, pad=2)
+        self.ax_3d.set_title(
+            f'θ={np.degrees(theta):.1f}°  φ={np.degrees(phi):.1f}°',
+            color='#c9d1d9', fontsize=9, pad=2)
         self.ax_3d.tick_params(colors='#30363d', labelsize=0)
         self.ax_3d.set_xlabel('', color='#30363d')
         self.ax_3d.set_ylabel('', color='#30363d')
         self.ax_3d.set_zlabel('', color='#30363d')
 
-        # Cube faces
-        faces = make_cube_faces(theta)
-        stable = abs(theta) < 0.05
+        # Cube faces — rotated on both axes
+        faces = make_cube_faces(theta, phi)
+        stable = abs(theta) < 0.05 and abs(phi) < 0.05
         face_color = '#1D9E75' if stable else '#D85A30'
-        alpha = 0.55
 
         poly = Poly3DCollection(faces,
                          facecolor=face_color,
                          edgecolor='#58a6ff',
                          linewidth=0.8)
         poly.set_alpha(0.55)
-
-
         self.ax_3d.add_collection3d(poly)
 
-        # Balance point indicator — vertical line
+        # Vertical reference line
         self.ax_3d.plot([0,0],[0,0],[-0.12,0.12],
                          color='#3fb950', lw=0.8, ls='--', alpha=0.5)
 
-        # Wheel indicator (circle on X face)
-        phi = np.linspace(0, 2*np.pi, 30)
-        wx  = np.full(30, L)
-        wy  = r_wheel * np.cos(phi)
-        wz  = r_wheel * np.sin(phi)
-        Rx  = np.array([[1,0,0],[0,np.cos(theta),-np.sin(theta)],
-                         [0,np.sin(theta), np.cos(theta)]])
-        w_pts = (Rx @ np.vstack([wx,wy,wz])).T
-        self.ax_3d.plot(w_pts[:,0], w_pts[:,1], w_pts[:,2],
-                         color='#ffa657', lw=1.5)
+        # Wheel indicator on X face (roll wheel)
+        phi_arr = np.linspace(0, 2*np.pi, 30)
+        wx = np.full(30, L)
+        wy = r_wheel * np.cos(phi_arr)
+        wz = r_wheel * np.sin(phi_arr)
+        Rx = np.array([[1,0,0],
+                       [0, np.cos(theta),-np.sin(theta)],
+                       [0, np.sin(theta), np.cos(theta)]])
+        Ry = np.array([[ np.cos(phi), 0, np.sin(phi)],
+                       [           0, 1,           0],
+                       [-np.sin(phi), 0, np.cos(phi)]])
+        R  = Ry @ Rx
+        w_pts_x = (R @ np.vstack([wx, wy, wz])).T
+        self.ax_3d.plot(w_pts_x[:,0], w_pts_x[:,1], w_pts_x[:,2],
+                         color='#ffa657', lw=1.5, label='X wheel')
+
+        # Wheel indicator on Y face (pitch wheel)
+        wy2 = np.full(30, L)
+        wx2 = r_wheel * np.cos(phi_arr)
+        wz2 = r_wheel * np.sin(phi_arr)
+        w_pts_y = (R @ np.vstack([wx2, wy2, wz2])).T
+        self.ax_3d.plot(w_pts_y[:,0], w_pts_y[:,1], w_pts_y[:,2],
+                         color='#58a6ff', lw=1.5, label='Y wheel')
 
     # ── Animation frame ───────────────────────────────────────
     def _animate(self, frame):
@@ -586,44 +677,48 @@ class FullSimulator:
 
         def update_line(line, xdata, ydata, ax):
             line.set_data(xdata, ydata)
-            ax.relim(); ax.autoscale_view()
-            if t_arr[-1] > t_arr[0]:
+            ax.relim()
+            ax.autoscale_view()
+            if len(t_arr) > 1:
                 ax.set_xlim(t_arr[0], t_arr[-1])
 
-        update_line(self.ln_true,  t_arr, list(self.hist_theta),  self.ax_angle)
-        update_line(self.ln_est,   t_arr, list(self.hist_est),    self.ax_angle)
-        update_line(self.ln_p,     t_arr, list(self.hist_p),      self.ax_pid)
-        update_line(self.ln_i,     t_arr, list(self.hist_i),      self.ax_pid)
-        update_line(self.ln_d,     t_arr, list(self.hist_d),      self.ax_pid)
-        update_line(self.ln_tau,   t_arr, list(self.hist_torque), self.ax_pid)
-        # Fix ax_pid minimum readable Y range
+        # Angle plot — both axes
+        update_line(self.ln_theta,  t_arr, list(self.hist_theta),   self.ax_angle)
+        update_line(self.ln_est_x,  t_arr, list(self.hist_est_x),   self.ax_angle)
+        update_line(self.ln_phi,    t_arr, list(self.hist_phi),     self.ax_angle)
+        update_line(self.ln_est_y,  t_arr, list(self.hist_est_y),   self.ax_angle)
+
+        # Torque plot — both axes
+        update_line(self.ln_tau_x,  t_arr, list(self.hist_torque_x), self.ax_pid)
+        update_line(self.ln_tau_y,  t_arr, list(self.hist_torque_y), self.ax_pid)
         ymin, ymax = self.ax_pid.get_ylim()
         if abs(ymax - ymin) < 0.01:
             self.ax_pid.set_ylim(-0.05, 0.05)
 
-        update_line(self.ln_vbat,  t_arr, list(self.hist_vbat),  self.ax_bat)
+        # Battery plot
+        update_line(self.ln_vbat,   t_arr, list(self.hist_vbat),    self.ax_bat)
 
-        # 3D cube
-        self._update_3d(self.physics.theta)
+        # 3D cube — pass both angles
+        self._update_3d(self.physics.theta, self.physics.phi)
 
         # Metrics
-        if self.hist_theta:
-            th = np.degrees(self.physics.theta)
-            vb = self.battery.voltage
-            lp = abs(self.pid.out)
-            ss = abs(self.hist_theta[-1]) < 0.01
+        if self.hist_theta and self.hist_phi:
+            th  = np.degrees(self.physics.theta)
+            ph  = np.degrees(self.physics.phi)
+            vb  = self.battery.voltage
+            ss  = abs(self.physics.theta) < 0.01 and abs(self.physics.phi) < 0.01
             self.metrics_txt.set_text(
-                f"θ={th:.2f}°  V={vb:.2f}V  τ={lp:.3f}N·m  "
+                f"θ={th:.2f}°  φ={ph:.2f}°  V={vb:.2f}V  "
                 f"t={self.t:.1f}s  {'STABLE' if ss else 'balancing...'}"
             )
 
-        return (self.ln_true, self.ln_est, self.ln_p, self.ln_i,
-                self.ln_d, self.ln_tau, self.ln_vbat)
+        return (self.ln_theta, self.ln_est_x, self.ln_phi, self.ln_est_y,
+                self.ln_tau_x, self.ln_tau_y, self.ln_vbat)
 
     def run(self):
-        self.fig.suptitle('Self-Balancing Cube — Full Realistic Simulation',
-                           color='#e6edf3', fontsize=12,
-                           fontweight='bold', y=0.995)
+        self.fig.suptitle(
+            'Self-Balancing Cube — Full Realistic Simulation  (Dual-Axis: Roll + Pitch)',
+            color='#e6edf3', fontsize=12, fontweight='bold', y=0.995)
         self.ani = animation.FuncAnimation(
             self.fig, self._animate,
             interval=33, blit=False, cache_frame_data=False)
@@ -633,15 +728,16 @@ class FullSimulator:
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    print("=" * 55)
+    print("=" * 60)
     print("  Self-Balancing Cube — Full Realistic Simulation")
-    print("=" * 55)
+    print("  Dual-axis: Roll (X) + Pitch (Y)")
+    print("=" * 60)
     print("  Controls:")
-    print("    Start — begin simulation")
-    print("    Stop  — pause")
-    print("    Reset — restart from initial tilt")
-    print("    Push! — apply random disturbance")
+    print("    Start  — begin simulation")
+    print("    Stop   — pause")
+    print("    Reset  — restart from initial tilt on both axes")
+    print("    Push!  — apply random disturbance to both axes")
     print("    IMU/BAT/MOT — toggle realism models on/off")
-    print("=" * 55)
+    print("=" * 60)
     sim = FullSimulator()
     sim.run()
